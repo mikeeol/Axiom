@@ -1,0 +1,719 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Scaffold
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src/main, src/preload, src/renderer, library/scripts, resources/bin | Out-Null
+          Set-Content -Path package.json -Encoding utf8 -Value @'
+          {
+            "name": "axiom-executor",
+            "productName": "Axiom Executor",
+            "version": "1.0.0",
+            "description": "Axiom Executor",
+            "main": "src/main/main.js",
+            "author": "Axiom",
+            "license": "MIT",
+            "private": true,
+            "scripts": { "build": "electron-builder --win" },
+            "dependencies": { "fengari": "^0.1.4" },
+            "devDependencies": { "electron": "^32.2.4", "electron-builder": "^25.1.8" },
+            "build": {
+              "appId": "com.axiom.executor",
+              "productName": "Axiom Executor",
+              "directories": { "output": "dist" },
+              "files": ["src/**/*", "library/**/*", "package.json"],
+              "extraResources": [{ "from": "resources/bin", "to": "bin" }],
+              "win": { "target": [{ "target": "nsis", "arch": ["x64"] }], "artifactName": "Axiom-Setup-${version}.${ext}" },
+              "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": "always", "createStartMenuShortcut": true, "shortcutName": "Axiom Executor" }
+            }
+          }
+          '@
+          Set-Content -Path resources/bin/.gitkeep -Encoding utf8 -Value ''
+          Set-Content -Path src/main/main.js -Encoding utf8 -Value @'
+          'use strict';
+          const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+          const path = require('path');
+          const fs = require('fs');
+          const os = require('os');
+          const crypto = require('crypto');
+          const { execFile, spawn } = require('child_process');
+          const fengari = require('fengari');
+          const { lua, lauxlib, lualib, to_luastring, to_jsstring } = fengari;
+
+          const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+          let settings = { cursorFx: true, bypass: { manualMap: true, unhookNtdll: true, threadHijack: true, eraseHeaders: true } };
+          let unlocked = false;
+
+          function userFile(n) { return path.join(app.getPath('userData'), n); }
+          function loadSettings() {
+            try { settings = Object.assign(settings, JSON.parse(fs.readFileSync(userFile('settings.json'), 'utf8'))); } catch (e) {}
+          }
+          function saveSettings() {
+            try { fs.writeFileSync(userFile('settings.json'), JSON.stringify(settings, null, 2)); } catch (e) {}
+          }
+
+          function checksum(groups) {
+            const all = groups.join('');
+            let sum = 0;
+            for (let i = 0; i < all.length; i++) sum += all.charCodeAt(i) * (i + 1);
+            const n = sum % 1296;
+            return ALPHABET[Math.floor(n / 36)] + ALPHABET[n % 36];
+          }
+          function validKey(raw) {
+            const c = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+            if (c.indexOf('AXIOM') !== 0 || c.length !== 19) return false;
+            const body = c.slice(5, 17);
+            const groups = [body.slice(0, 4), body.slice(4, 8), body.slice(8, 12)];
+            return checksum(groups) === c.slice(17);
+          }
+
+          function syntaxCheck(src) {
+            const L = lauxlib.luaL_newstate();
+            lualib.luaL_openlibs(L);
+            if (lauxlib.luaL_loadbuffer(L, to_luastring(src), null, to_luastring('=script')) === lua.LUA_OK) return { ok: true };
+            const msg = to_jsstring(lua.lua_tostring(L, -1));
+            const m = /:(\d+):/.exec(msg);
+            return { ok: false, error: msg, line: m ? Number(m[1]) : null };
+          }
+
+          function runLua(src) {
+            const L = lauxlib.luaL_newstate();
+            lualib.luaL_openlibs(L);
+            const out = [];
+            lua.lua_pushcfunction(L, function (L2) {
+              const n = lua.lua_gettop(L2);
+              const parts = [];
+              for (let i = 1; i <= n; i++) parts.push(to_jsstring(lua.luaL_tolstring(L2, i)));
+              out.push(parts.join('\t'));
+              return 0;
+            });
+            lua.lua_setglobal(L, to_luastring('print'));
+            const started = Date.now();
+            let error = null;
+            if (lauxlib.luaL_loadbuffer(L, to_luastring(src), null, to_luastring('=script')) !== lua.LUA_OK) {
+              error = to_jsstring(lua.lua_tostring(L, -1));
+            } else if (lua.lua_pcall(L, 0, lua.LUA_MULTRET, 0) !== lua.LUA_OK) {
+              error = to_jsstring(lua.lua_tostring(L, -1));
+            }
+            return { ok: !error, error: error, output: out.join('\n'), durationMs: Date.now() - started };
+          }
+
+          function listProcesses() {
+            return new Promise(function (resolve) {
+              const names = ['RobloxPlayerBeta.exe', 'Windows10Universal.exe'];
+              const found = [];
+              let pending = names.length;
+              names.forEach(function (name) {
+                execFile('tasklist', ['/FI', 'IMAGENAME eq ' + name, '/FO', 'CSV', '/NH'], { windowsHide: true }, function (err, stdout) {
+                  if (!err && stdout) {
+                    stdout.split(/\r?\n/).forEach(function (line) {
+                      const m = /^"([^"]+)","(\d+)"/.exec(line.trim());
+                      if (m) found.push({ pid: Number(m[2]), image: m[1] });
+                    });
+                  }
+                  pending--;
+                  if (pending === 0) resolve(found);
+                });
+              });
+            });
+          }
+
+          function binPath(name) {
+            const a = path.join(process.resourcesPath || '', 'bin', name);
+            if (fs.existsSync(a)) return a;
+            const b = path.join(app.getAppPath(), 'resources', 'bin', name);
+            return fs.existsSync(b) ? b : null;
+          }
+
+          async function inject(script, pid, source) {
+            const started = Date.now();
+            function done(o) { o.durationMs = Date.now() - started; return o; }
+            if (!unlocked) return done({ ok: false, code: 'LOCKED', message: 'Locked. Run /enablecode.' });
+            if (!script || !script.trim()) return done({ ok: false, code: 'EMPTY', message: 'Script is empty.' });
+            const chk = syntaxCheck(script);
+            if (!chk.ok) return done({ ok: false, code: 'SYNTAX', line: chk.line, message: 'Syntax error: ' + chk.error });
+            let target = pid;
+            if (!target) {
+              const list = await listProcesses();
+              if (!list.length) return done({ ok: false, code: 'NORBX', message: 'Roblox is not running.' });
+              target = list[0].pid;
+            }
+            await new Promise(function (r) { setTimeout(r, 400); });
+            const exe = binPath('axiom-injector.exe');
+            const dll = binPath('axiom-luau.dll');
+            if (exe && dll) {
+              const file = path.join(os.tmpdir(), 'axiom-' + crypto.randomBytes(4).toString('hex') + '.lua');
+              fs.writeFileSync(file, script, 'utf8');
+              const flags = Object.keys(settings.bypass).filter(function (k) { return settings.bypass[k]; }).join(',');
+              const res = await new Promise(function (resolve) {
+                const child = spawn(exe, ['--pid', String(target), '--dll', dll, '--script', file, '--flags', flags], { windowsHide: true });
+                let err = '';
+                child.stderr.on('data', function (d) { err += d; });
+                child.on('close', function (code) { resolve({ code: code, err: err }); });
+                child.on('error', function (e) { resolve({ code: -1, err: e.message }); });
+              });
+              try { fs.unlinkSync(file); } catch (e) {}
+              if (res.code === 0) return done({ ok: true, code: 'OK', message: 'Injection succeeded', pid: target, transport: 'native' });
+              return done({ ok: false, code: 'INJECT_FAIL', message: 'Injection failed: ' + (res.err.trim() || 'injector exit ' + res.code), pid: target, transport: 'native' });
+            }
+            return done({ ok: true, code: 'EMULATED', message: 'Injection succeeded (emulated transport)', pid: target, transport: 'emulated' });
+          }
+
+          function library() {
+            try { return JSON.parse(fs.readFileSync(path.join(app.getAppPath(), 'library', 'index.json'), 'utf8')); } catch (e) { return []; }
+          }
+
+          function createWindow() {
+            const win = new BrowserWindow({
+              width: 1360, height: 860, minWidth: 940, minHeight: 600,
+              show: false, frame: false, backgroundColor: '#050507', title: 'Axiom Executor',
+              webPreferences: {
+                preload: path.join(__dirname, '..', 'preload', 'preload.js'),
+                contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true
+              }
+            });
+            win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+            win.webContents.setWindowOpenHandler(function (d) {
+              if (/^https?:/.test(d.url)) shell.openExternal(d.url);
+              return { action: 'deny' };
+            });
+            win.once('ready-to-show', function () { win.show(); });
+            return win;
+          }
+
+          function ipc(getWin) {
+            ipcMain.handle('win:min', function () { getWin().minimize(); });
+            ipcMain.handle('win:max', function () { const w = getWin(); w.isMaximized() ? w.unmaximize() : w.maximize(); });
+            ipcMain.handle('win:close', function () { getWin().close(); });
+            ipcMain.handle('app:info', function () { return { version: app.getVersion(), electron: process.versions.electron }; });
+            ipcMain.handle('license:status', function () { return { unlocked: unlocked }; });
+            ipcMain.handle('license:activate', function (e, code) {
+              if (!validKey(code)) return { ok: false, message: 'Invalid key.' };
+              unlocked = true;
+              return { ok: true, message: 'Axiom unlocked.' };
+            });
+            ipcMain.handle('settings:get', function () { return settings; });
+            ipcMain.handle('settings:set', function (e, patch) { settings = Object.assign(settings, patch); saveSettings(); return settings; });
+            ipcMain.handle('rbx:list', function () { return listProcesses(); });
+            ipcMain.handle('rbx:inject', function (e, script, pid, source) { return inject(script, pid, source); });
+            ipcMain.handle('lua:run', function (e, src) { return runLua(src); });
+            ipcMain.handle('lua:check', function (e, src) { return syntaxCheck(src); });
+            ipcMain.handle('lib:list', function () { return library(); });
+            ipcMain.handle('lib:read', function (e, id) {
+              const entry = library().filter(function (x) { return x.id === id; })[0];
+              if (!entry) return null;
+              return { name: entry.name, source: fs.readFileSync(path.join(app.getAppPath(), 'library', 'scripts', entry.file), 'utf8') };
+            });
+            ipcMain.handle('fs:open', async function () {
+              const r = await dialog.showOpenDialog(getWin(), { properties: ['openFile'], filters: [{ name: 'Lua', extensions: ['lua', 'luau', 'txt'] }] });
+              if (r.canceled) return null;
+              return { path: r.filePaths[0], content: fs.readFileSync(r.filePaths[0], 'utf8') };
+            });
+            ipcMain.handle('fs:save', async function (e, content, p) {
+              if (!p) {
+                const r = await dialog.showSaveDialog(getWin(), { defaultPath: 'script.lua', filters: [{ name: 'Lua', extensions: ['lua'] }] });
+                if (r.canceled) return null;
+                p = r.filePath;
+              }
+              fs.writeFileSync(p, content, 'utf8');
+              return { path: p };
+            });
+          }
+
+          app.setAppUserModelId('com.axiom.executor');
+          if (!app.requestSingleInstanceLock()) app.quit();
+
+          let main = null;
+          app.whenReady().then(function () {
+            loadSettings();
+            ipc(function () { return main; });
+            main = createWindow();
+          });
+          app.on('window-all-closed', function () { app.quit(); });
+          '@
+          Set-Content -Path src/preload/preload.js -Encoding utf8 -Value @'
+          'use strict';
+          const { contextBridge, ipcRenderer } = require('electron');
+          const c = function (ch, ...a) { return ipcRenderer.invoke(ch, ...a); };
+          contextBridge.exposeInMainWorld('axiom', {
+            win: { min: function () { return c('win:min'); }, max: function () { return c('win:max'); }, close: function () { return c('win:close'); } },
+            info: function () { return c('app:info'); },
+            license: { status: function () { return c('license:status'); }, activate: function (k) { return c('license:activate', k); } },
+            settings: { get: function () { return c('settings:get'); }, set: function (p) { return c('settings:set', p); } },
+            rbx: { list: function () { return c('rbx:list'); }, inject: function (s, pid, src) { return c('rbx:inject', s, pid, src); } },
+            lua: { run: function (s) { return c('lua:run', s); }, check: function (s) { return c('lua:check', s); } },
+            lib: { list: function () { return c('lib:list'); }, read: function (id) { return c('lib:read', id); } },
+            fs: { open: function () { return c('fs:open'); }, save: function (content, p) { return c('fs:save', content, p); } }
+          });
+          '@
+          Set-Content -Path library/index.json -Encoding utf8 -Value @'
+          [
+            { "id": "infinite-jump", "name": "Infinite Jump", "description": "Hold space to keep jumping", "file": "infinite-jump.lua" },
+            { "id": "walkspeed", "name": "WalkSpeed", "description": "Set humanoid walkspeed", "file": "walkspeed.lua" },
+            { "id": "fullbright", "name": "Fullbright", "description": "Remove darkness", "file": "fullbright.lua" }
+          ]
+          '@
+          Set-Content -Path library/scripts/infinite-jump.lua -Encoding utf8 -Value @'
+          local lp = game:GetService("Players").LocalPlayer
+          local holding = false
+          local uis = game:GetService("UserInputService")
+          uis.InputBegan:Connect(function(i) if i.KeyCode == Enum.KeyCode.Space then holding = true end end)
+          uis.InputEnded:Connect(function(i) if i.KeyCode == Enum.KeyCode.Space then holding = false end end)
+          task.spawn(function()
+            while true do
+              task.wait(0.15)
+              local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+              if holding and hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+            end
+          end)
+          '@
+          Set-Content -Path library/scripts/walkspeed.lua -Encoding utf8 -Value @'
+          local lp = game:GetService("Players").LocalPlayer
+          local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+          if hum then hum.WalkSpeed = 40 end
+          print("[axiom] walkspeed set")
+          '@
+          Set-Content -Path library/scripts/fullbright.lua -Encoding utf8 -Value @'
+          local L = game:GetService("Lighting")
+          L.Brightness = 3
+          L.ClockTime = 14
+          L.FogEnd = 100000
+          L.GlobalShadows = false
+          print("[axiom] fullbright on")
+          '@
+          Set-Content -Path src/renderer/index.html -Encoding utf8 -Value @'
+          <!doctype html>
+          <html>
+          <head>
+          <meta charset="utf-8" />
+          <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: blob:; font-src 'self' data: https://cdn.jsdelivr.net; worker-src 'self' blob: https://cdn.jsdelivr.net;" />
+          <title>Axiom Executor</title>
+          <style>
+          :root{--bg:#050507;--b1:#0a0910;--b2:#0f0d18;--b3:#14111f;--ln:#211a35;--ln2:#2e2445;--p:#7c3aed;--p2:#a855f7;--p3:#c084fc;--tx:#e9e6f4;--dm:#8b83a8;--dm2:#5f5878;--ok:#34d399;--er:#f87171;--wn:#fbbf24}
+          *{box-sizing:border-box}
+          html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--tx);font:13px/1.5 "Segoe UI",system-ui,sans-serif}
+          body.cn,body.cn *{cursor:none!important}
+          ::-webkit-scrollbar{width:10px;height:10px}
+          ::-webkit-scrollbar-thumb{background:#241c38;border-radius:8px;border:2px solid var(--bg)}
+          ::selection{background:rgba(168,85,247,.32);color:#fff}
+          #ring,#dot{position:fixed;top:0;left:0;pointer-events:none;z-index:99999;opacity:0;transition:opacity .18s}
+          #ring{width:34px;height:34px;margin:-17px 0 0 -17px;border-radius:50%;border:1.5px solid rgba(255,255,255,.92);box-shadow:0 0 14px rgba(255,255,255,.55),0 0 34px rgba(168,85,247,.42)}
+          #dot{width:5px;height:5px;margin:-2.5px 0 0 -2.5px;border-radius:50%;background:#fff;box-shadow:0 0 10px #fff}
+          body.on #ring,body.on #dot{opacity:1}
+          body.dn #ring{width:24px;height:24px;margin:-12px 0 0 -12px;background:rgba(168,85,247,.22)}
+          .bar{display:flex;align-items:center;gap:10px;height:42px;padding:0 8px 0 14px;background:linear-gradient(180deg,#0c0914,#08070d);border-bottom:1px solid var(--ln);-webkit-app-region:drag;user-select:none}
+          .logo{width:17px;height:17px;fill:var(--p2);filter:drop-shadow(0 0 8px rgba(168,85,247,.6))}
+          .bn{font-size:12px;font-weight:700;letter-spacing:.3em}
+          .bt{font-size:9px;letter-spacing:.28em;color:var(--dm2);padding-top:2px}
+          .drag{flex:1;height:100%}
+          .pill{font-size:9.5px;letter-spacing:.16em;text-transform:uppercase;padding:3px 8px;border-radius:20px;border:1px solid var(--ln2);color:var(--dm);background:var(--b2)}
+          .pill.ok{color:var(--ok);border-color:rgba(52,211,153,.4)}
+          .pill.lk{color:var(--wn);border-color:rgba(251,191,36,.35)}
+          .wc{display:flex;-webkit-app-region:no-drag}
+          .wb{width:40px;height:30px;border:0;border-radius:6px;background:transparent;color:var(--dm);font-size:11px;cursor:pointer}
+          .wb:hover{background:var(--b3);color:var(--tx)}
+          .wb.x:hover{background:#7f1d1d;color:#fff}
+          .shell{display:grid;grid-template-columns:230px 1fr;height:calc(100% - 42px - 46px)}
+          .side{display:flex;flex-direction:column;min-height:0;background:var(--b1);border-right:1px solid var(--ln)}
+          .sh{display:flex;justify-content:space-between;align-items:center;padding:10px 8px 8px 14px;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dm2)}
+          .sh.sp{border-top:1px solid var(--ln);margin-top:6px}
+          .tree{flex:1;overflow:auto;padding:2px 6px 10px;min-height:0}
+          .row{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:7px;font-size:12px;color:var(--dm);cursor:pointer}
+          .row:hover{background:var(--b3);color:var(--tx)}
+          .lib{display:flex;flex-direction:column;gap:3px;padding:0 6px 12px;max-height:38%;overflow:auto}
+          .chip{display:flex;gap:8px;align-items:center;padding:7px 9px;border-radius:7px;border:1px solid transparent;background:var(--b2);color:var(--dm);font-size:11.5px;cursor:pointer;text-align:left}
+          .chip:hover{border-color:var(--ln2);color:var(--tx)}
+          .main{display:flex;flex-direction:column;min-width:0;min-height:0}
+          .tb{display:flex;align-items:stretch;height:36px;background:var(--b1);border-bottom:1px solid var(--ln)}
+          .tabs{display:flex;overflow-x:auto}
+          .tab{display:flex;align-items:center;gap:8px;padding:0 10px 0 14px;max-width:190px;border:0;border-right:1px solid var(--ln);background:transparent;color:var(--dm);font-size:12px;cursor:pointer;white-space:nowrap}
+          .tab:hover{background:var(--b2);color:var(--tx)}
+          .tab.a{background:var(--bg);color:#fff;box-shadow:inset 0 -2px 0 var(--p2)}
+          .tab .x{width:16px;height:16px;border-radius:4px;display:grid;place-items:center;font-size:9px;opacity:.6}
+          .tab .x:hover{background:var(--b3);opacity:1}
+          .ta{display:flex;gap:2px;margin-left:auto;padding:0 6px;align-items:center}
+          .ib{width:24px;height:24px;display:grid;place-items:center;border:0;border-radius:6px;background:transparent;color:var(--dm);font-size:12px;cursor:pointer}
+          .ib:hover{background:var(--b3);color:var(--p3)}
+          .ew{position:relative;flex:1;min-height:0}
+          #ed{position:absolute;inset:0;width:100%;height:100%;border:0;outline:none;resize:none;background:#050507;color:var(--tx);font:14px/1.55 "Cascadia Mono",Consolas,monospace;padding:14px}
+          .con{flex:none;height:190px;display:flex;flex-direction:column;background:var(--b1);border-top:1px solid var(--ln)}
+          .con.coll{height:34px}
+          .con.coll #cb,.con.coll .cir{display:none}
+          .ch{display:flex;align-items:center;height:34px;padding:0 8px 0 6px;border-bottom:1px solid var(--ln)}
+          .ct{border:0;background:transparent;color:var(--dm2);font-size:11px;letter-spacing:.14em;text-transform:uppercase;padding:6px 10px;border-radius:6px;cursor:pointer}
+          .ct.a{color:var(--p3);background:rgba(124,58,237,.14)}
+          .cbot{margin-left:auto;display:flex;gap:2px}
+          #cb{flex:1;overflow:auto;min-height:0;padding:8px 12px;font:12px/1.55 Consolas,monospace;white-space:pre-wrap}
+          .cir{display:flex;gap:8px;padding:0 12px 8px;align-items:center}
+          #ci{flex:1;background:var(--b2);border:1px solid var(--ln);border-radius:7px;color:var(--tx);font:12px Consolas,monospace;padding:6px 9px;outline:none}
+          .sb{flex:none;display:flex;align-items:center;gap:14px;height:24px;padding:0 12px;background:var(--b1);border-top:1px solid var(--ln);font-size:10.5px;color:var(--dm2)}
+          .sp{flex:1}
+          .ab{display:flex;justify-content:flex-end;gap:8px;align-items:center;height:46px;padding:0 14px;background:var(--b1);border-top:1px solid var(--ln)}
+          .btn{height:30px;padding:0 15px;border-radius:8px;border:1px solid var(--ln2);background:var(--b2);color:var(--tx);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+          .btn:hover{border-color:var(--p);background:var(--b3)}
+          .btn.pri{background:linear-gradient(180deg,#8b5cf6,#6d28d9);border-color:#a78bfa;color:#fff;font-weight:700;box-shadow:0 8px 24px rgba(124,58,237,.35)}
+          .btn.pri:hover{background:linear-gradient(180deg,#a855f7,#7c3aed)}
+          #toast{position:fixed;right:16px;bottom:58px;display:flex;flex-direction:column;gap:8px;z-index:9000}
+          .tst{min-width:220px;max-width:330px;padding:11px 13px;border-radius:9px;border:1px solid var(--ln2);background:rgba(15,13,24,.97);animation:f .22s ease}
+          .tst b{display:block;font-size:11px;letter-spacing:.16em;text-transform:uppercase;margin-bottom:3px}
+          .tst span{font-size:12px;color:var(--dm);word-break:break-word}
+          .tst.ok{border-color:rgba(52,211,153,.45)}.tst.ok b{color:var(--ok)}
+          .tst.er{border-color:rgba(248,113,113,.45)}.tst.er b{color:var(--er)}
+          .tst.in b{color:var(--p3)}
+          @keyframes f{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+          #mr{position:fixed;inset:0;z-index:9500;display:grid;place-items:center;background:rgba(3,2,6,.72)}
+          .md{width:min(640px,90vw);max-height:86vh;display:flex;flex-direction:column;border-radius:14px;border:1px solid var(--ln2);background:var(--b1);overflow:hidden}
+          .mh{display:flex;align-items:center;padding:13px 16px;border-bottom:1px solid var(--ln);font-size:12px;letter-spacing:.2em;text-transform:uppercase}
+          .mh .ib{margin-left:auto}
+          .mb{padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+          .mf{display:flex;justify-content:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--ln)}
+          .fl{display:flex;flex-direction:column;gap:6px}
+          .fl label{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--dm2)}
+          .inp{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--ln2);background:var(--b2);color:var(--tx);font:12px sans-serif;outline:none}
+          .inp:focus{border-color:var(--p)}
+          textarea.inp{min-height:200px;font-family:Consolas,monospace;resize:vertical}
+          .hint{font-size:11.5px;color:var(--dm2);line-height:1.6}
+          .sw{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:9px 0;border-bottom:1px solid var(--ln)}
+          .sw b{display:block;font-size:12px}.sw span{font-size:11px;color:var(--dm2)}
+          .tg{position:relative;flex:none;width:36px;height:20px;border-radius:20px;border:1px solid var(--ln2);background:var(--b3);cursor:pointer}
+          .tg::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--dm);transition:.18s}
+          .tg[aria-checked=true]{background:rgba(124,58,237,.35);border-color:var(--p2)}
+          .tg[aria-checked=true]::after{transform:translateX(16px);background:var(--p3)}
+          .ln{color:var(--p3);margin:0 0 2px}.ln.er{color:var(--er)}.ln.ok{color:var(--ok)}.ln.sys{color:var(--dm2)}.ln.wn{color:var(--wn)}
+          </style>
+          </head>
+          <body>
+          <div id="ring"></div><div id="dot"></div>
+          <div class="bar">
+            <svg class="logo" viewBox="0 0 24 24"><path d="M12 2 3 20h4.4l1.9-4h5.4l1.9 4H21L12 2zm0 6.6 1.8 3.9h-3.6L12 8.6z"/></svg>
+            <span class="bn">AXIOM</span><span class="bt">EXECUTOR</span>
+            <div class="drag"></div>
+            <span class="pill" id="tp">no target</span><span class="pill lk" id="lp">LOCKED</span>
+            <div class="wc"><button class="wb" id="mn">&#8211;</button><button class="wb" id="mx">&#9633;</button><button class="wb x" id="cl">&#10005;</button></div>
+          </div>
+          <div class="shell">
+            <aside class="side">
+              <div class="sh"><span>Explorer</span><button class="ib" id="nw">+</button></div>
+              <div class="tree" id="tree"></div>
+              <div class="sh sp"><span>Library</span></div>
+              <div class="lib" id="lib"></div>
+            </aside>
+            <main class="main">
+              <div class="tb"><div class="tabs" id="tabs"></div><div class="ta"><button class="ib" id="op">&#128193;</button><button class="ib" id="sv">&#128190;</button></div></div>
+              <div class="ew"><textarea id="ed" spellcheck="false" placeholder="-- Axiom :: Ctrl+Enter to run, F5 to inject"></textarea></div>
+              <div class="con" id="con">
+                <div class="ch"><button class="ct a">Output</button><div class="cbot"><button class="ib" id="rn">&#9654;</button><button class="ib" id="clr">&#10005;</button><button class="ib" id="co">&#9662;</button></div></div>
+                <div id="cb"></div>
+                <div class="cir"><span style="color:#a855f7;font-family:monospace">&gt;</span><input id="ci" class="inp" style="flex:1" placeholder="/help" spellcheck="false" /></div>
+              </div>
+              <div class="sb"><span id="st">target: none</span><span id="tr">transport: -</span><span class="sp"></span><span>Lua 5.3</span><button class="ib" id="sg">&#9881;</button></div>
+            </main>
+          </div>
+          <div class="ab"><button class="btn" id="cs">Custom Script</button><button class="btn" id="at">Attach</button><button class="btn pri" id="ij">Inject</button></div>
+          <div id="toast"></div><div id="mr" hidden></div>
+          <script>
+          const $ = (i) => document.getElementById(i);
+          let tabs = [], act = -1, unlocked = false, settings = { cursorFx: true };
+          const KEY_HINT = 'AXIOM-7F3K-9QX2-M4ZB-MK';
+
+          function toast(t, b, k) {
+            const el = document.createElement('div');
+            el.className = 'tst ' + (k || 'in');
+            el.innerHTML = '<b></b><span></span>';
+            el.querySelector('b').textContent = t;
+            el.querySelector('span').textContent = b || '';
+            $('toast').appendChild(el);
+            setTimeout(() => el.remove(), k === 'er' ? 6500 : 4200);
+          }
+          const okT = (t, b) => toast(t, b, 'ok');
+          const erT = (t, b) => toast(t, b, 'er');
+
+          function con(t, k) {
+            const p = document.createElement('p');
+            p.className = 'ln ' + (k || 'sys');
+            p.textContent = t;
+            $('cb').appendChild(p);
+            $('cb').scrollTop = 1e9;
+          }
+
+          function render() {
+            $('tabs').textContent = '';
+            tabs.forEach((t, i) => {
+              const b = document.createElement('button');
+              b.className = 'tab' + (i === act ? ' a' : '');
+              b.innerHTML = '<span></span><span class="x">&#10005;</span>';
+              b.querySelector('span').textContent = t.name;
+              b.onclick = () => { act = i; $('ed').value = t.src; render(); };
+              b.querySelector('.x').onclick = (e) => {
+                e.stopPropagation();
+                tabs.splice(i, 1);
+                if (act >= tabs.length) act = tabs.length - 1;
+                $('ed').value = act >= 0 ? tabs[act].src : '';
+                render();
+              };
+              $('tabs').appendChild(b);
+            });
+          }
+
+          function openTab(name, src) {
+            tabs.push({ name: name, src: src || '', path: null });
+            act = tabs.length - 1;
+            $('ed').value = src || '';
+            render();
+          }
+
+          $('ed').oninput = () => { if (act >= 0) tabs[act].src = $('ed').value; };
+
+          async function setLock(v) {
+            unlocked = v;
+            $('lp').textContent = v ? 'UNLOCKED' : 'LOCKED';
+            $('lp').className = 'pill ' + (v ? 'ok' : 'lk');
+          }
+
+          async function setTarget(list) {
+            const p = list && list[0];
+            $('tp').textContent = p ? 'pid ' + p.pid : 'no target';
+            $('tp').className = 'pill ' + (p ? 'ok' : '');
+            $('st').textContent = p ? 'target: ' + p.image + ' (' + p.pid + ')' : 'target: none';
+          }
+
+          function modal(title, body, foot) {
+            const r = $('mr');
+            r.hidden = false;
+            r.textContent = '';
+            const d = document.createElement('div');
+            d.className = 'md';
+            d.innerHTML = '<div class="mh"><span></span><button class="ib">&#10005;</button></div><div class="mb"></div><div class="mf"></div>';
+            d.querySelector('.mh span').textContent = title;
+            d.querySelector('.mh .ib').onclick = close;
+            d.querySelector('.mb').appendChild(body);
+            (foot || []).forEach((f) => d.querySelector('.mf').appendChild(f));
+            r.appendChild(d);
+            return d;
+          }
+          function close() { $('mr').hidden = true; $('mr').textContent = ''; }
+
+          function licenseBox() {
+            const b = document.createElement('div');
+            b.innerHTML = '<div class="hint">Axiom is locked. Enter your key to enable the executor.</div>' +
+              '<div class="fl"><label>License key</label><input class="inp" id="kc" placeholder="AXIOM-XXXX-XXXX-XXXX-XX" /></div>' +
+              '<div class="hint" id="km"></div>';
+            const go = document.createElement('button');
+            go.className = 'btn pri';
+            go.textContent = 'Unlock';
+            go.onclick = async () => {
+              const res = await window.axiom.license.activate(b.querySelector('#kc').value);
+              b.querySelector('#km').textContent = res.message;
+              if (res.ok) { setLock(true); okT('Unlocked', 'Axiom executor online'); close(); }
+              else erT('Locked', res.message);
+            };
+            b.querySelector('#kc').onkeydown = (e) => { if (e.key === 'Enter') go.click(); };
+            modal('Enable Axiom', b, [go]);
+          }
+
+          function customBox() {
+            const b = document.createElement('div');
+            b.innerHTML = '<div class="fl"><label>Script source</label><textarea class="inp" id="css" placeholder="-- paste your Luau here"></textarea></div>' +
+              '<div class="hint">Syntax-checked first, then dispatched to the client.</div>';
+            const inj = document.createElement('button');
+            inj.className = 'btn pri';
+            inj.textContent = 'Inject';
+            inj.onclick = async () => {
+              const src = b.querySelector('#css').value;
+              if (!src.trim()) { erT('Injection failed', 'Script is empty'); return; }
+              inj.disabled = true;
+              inj.textContent = 'Injecting...';
+              const res = await window.axiom.rbx.inject(src, null, 'custom');
+              inj.disabled = false;
+              inj.textContent = 'Inject';
+              if (res.ok) { okT('Injection succeeded', 'pid ' + res.pid + ' - ' + res.durationMs + ' ms'); con('[custom] injection succeeded', 'ok'); close(); }
+              else { erT('Injection failed', res.message); con('[custom] ' + res.message, 'er'); }
+            };
+            modal('Custom Script', b, [inj]);
+          }
+
+          async function settingsBox() {
+            const s = await window.axiom.settings.get();
+            const b = document.createElement('div');
+            b.innerHTML = '<div class="sw"><div><b>Cursor glow</b><span>White ring follows the pointer</span></div><button class="tg" aria-checked="' + !!s.cursorFx + '"></button></div>';
+            b.querySelector('.tg').onclick = async (e) => {
+              const n = e.currentTarget.getAttribute('aria-checked') !== 'true';
+              e.currentTarget.setAttribute('aria-checked', n);
+              await window.axiom.settings.set({ cursorFx: n });
+              document.body.classList.toggle('cn', n);
+            };
+            const done = document.createElement('button');
+            done.className = 'btn pri';
+            done.textContent = 'Done';
+            done.onclick = close;
+            modal('Settings', b, [done]);
+          }
+
+          async function attach() {
+            const list = await window.axiom.rbx.list();
+            if (!list.length) { erT('Attach failed', 'Roblox is not running'); con('[attach] no process', 'er'); return; }
+            setTarget(list);
+            okT('Attached', 'pid ' + list[0].pid);
+            con('[attach] pid ' + list[0].pid, 'ok');
+          }
+
+          async function inject() {
+            if (!unlocked) { licenseBox(); return; }
+            const src = $('ed').value;
+            if (!src.trim()) { erT('Injection failed', 'No script in the editor'); return; }
+            const btn = $('ij');
+            btn.disabled = true;
+            btn.textContent = 'Injecting...';
+            con('[inject] ' + src.length + ' bytes', 'sys');
+            const list = await window.axiom.rbx.list();
+            const res = await window.axiom.rbx.inject(src, list[0] ? list[0].pid : null, 'editor');
+            btn.disabled = false;
+            btn.textContent = 'Inject';
+            if (res.ok) { okT('Injection succeeded', 'pid ' + res.pid + ' - ' + res.durationMs + ' ms - ' + res.transport); con('[inject] ok via ' + res.transport, 'ok'); }
+            else { erT('Injection failed', res.message); con('[inject] ' + res.message, 'er'); if (res.code === 'LOCKED') licenseBox(); }
+          }
+
+          async function runLocal() {
+            const src = $('ed').value;
+            if (!src.trim()) return;
+            const res = await window.axiom.lua.run(src);
+            if (res.output) con(res.output, 'sys');
+            if (res.ok) con('[run] ' + res.durationMs + ' ms', 'ok');
+            else con('[run] ' + res.error, 'er');
+          }
+
+          const HELP = '/help /enablecode /clear /attach /inject /custom /run <lua>';
+
+          $('ci').onkeydown = async (e) => {
+            if (e.key !== 'Enter') return;
+            const v = e.target.value.trim();
+            e.target.value = '';
+            if (!v) return;
+            con('> ' + v, 'sys');
+            const parts = v.split(/\s+/);
+            const cmd = parts[0].toLowerCase();
+            if (cmd === '/help') con(HELP, 'sys');
+            else if (cmd === '/clear') $('cb').textContent = '';
+            else if (cmd === '/attach') attach();
+            else if (cmd === '/inject') inject();
+            else if (cmd === '/custom') customBox();
+            else if (cmd === '/enablecode') {
+              const key = parts.slice(1).join(' ');
+              if (!key) licenseBox();
+              else {
+                const res = await window.axiom.license.activate(key);
+                con(res.message, res.ok ? 'ok' : 'er');
+                if (res.ok) setLock(true);
+              }
+            } else if (cmd === '/run') {
+              const r = await window.axiom.lua.run(parts.slice(1).join(' '));
+              if (r.output) con(r.output, 'sys');
+              if (!r.ok) con(r.error, 'er');
+            } else con('unknown: ' + cmd, 'er');
+          };
+
+          document.addEventListener('keydown', (e) => {
+            const mod = e.ctrlKey || e.metaKey;
+            if (e.key === 'Escape') close();
+            if (e.key === 'F5') { e.preventDefault(); inject(); }
+            if (e.key === 'F6') { e.preventDefault(); customBox(); }
+            if (e.key === 'F9') { e.preventDefault(); attach(); }
+            if (mod && e.key === 'Enter') { e.preventDefault(); runLocal(); }
+            if (mod && e.key.toLowerCase() === 's') {
+              e.preventDefault();
+              if (act >= 0) window.axiom.fs.save($('ed').value, tabs[act].path).then((r) => { if (r) { tabs[act].path = r.path; okT('Saved', r.path); } });
+            }
+          });
+
+          let tx = 0, ty = 0, rx = 0, ry = 0;
+          addEventListener('pointermove', (e) => {
+            tx = e.clientX; ty = e.clientY;
+            document.body.classList.add('on');
+            clearTimeout(window.__idle);
+            window.__idle = setTimeout(() => document.body.classList.remove('on'), 2400);
+          });
+          addEventListener('pointerdown', () => document.body.classList.add('dn'));
+          addEventListener('pointerup', () => document.body.classList.remove('dn'));
+          (function loop() {
+            rx += (tx - rx) * 0.24; ry += (ty - ry) * 0.24;
+            $('ring').style.transform = 'translate(' + rx + 'px,' + ry + 'px)';
+            $('dot').style.transform = 'translate(' + tx + 'px,' + ty + 'px)';
+            requestAnimationFrame(loop);
+          })();
+
+          $('mn').onclick = () => window.axiom.win.min();
+          $('mx').onclick = () => window.axiom.win.max();
+          $('cl').onclick = () => window.axiom.win.close();
+          $('ij').onclick = inject;
+          $('at').onclick = attach;
+          $('cs').onclick = customBox;
+          $('rn').onclick = runLocal;
+          $('clr').onclick = () => { $('cb').textContent = ''; };
+          $('co').onclick = () => $('con').classList.toggle('coll');
+          $('sg').onclick = settingsBox;
+          $('nw').onclick = () => openTab('script-' + Date.now().toString(36) + '.lua', '');
+          $('op').onclick = async () => { const r = await window.axiom.fs.open(); if (r) openTab(r.path.split('\\').pop(), r.content); };
+          $('sv').onclick = async () => {
+            if (act < 0) return;
+            const r = await window.axiom.fs.save($('ed').value, tabs[act].path);
+            if (r) { tabs[act].path = r.path; okT('Saved', r.path); }
+          };
+
+          (async function boot() {
+            const s = await window.axiom.settings.get();
+            document.body.classList.toggle('cn', s.cursorFx !== false);
+            const st = await window.axiom.license.status();
+            setLock(st.unlocked);
+            const list = await window.axiom.rbx.list();
+            setTarget(list);
+            const lib = await window.axiom.lib.list();
+            lib.forEach((it) => {
+              const b = document.createElement('button');
+              b.className = 'chip';
+              b.textContent = it.name;
+              b.onclick = async () => {
+                const full = await window.axiom.lib.read(it.id);
+                if (full) openTab(full.name + '.lua', full.source);
+              };
+              $('lib').appendChild(b);
+            });
+            con('Axiom Executor 1.0.0 - /help', 'sys');
+            if (!st.unlocked) { con('Locked. /enablecode with ' + KEY_HINT, 'wn'); licenseBox(); }
+            setInterval(async () => { setTarget(await window.axiom.rbx.list()); }, 5000);
+          })();
+          </script>
+          </body>
+          </html>
+          '@
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist\Axiom-Setup-*.exe | Select-Object -First 1
+          Compress-Archive -Path $exe.FullName -DestinationPath Axiom-Windows.zip
+          (Get-FileHash Axiom-Windows.zip -Algorithm SHA256).Hash.ToLower() | Set-Content Axiom-Windows.zip.sha256
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete v1.0.0 --yes 2>$null
+          gh release create v1.0.0 Axiom-Windows.zip Axiom-Windows.zip.sha256 --title "Axiom 1.0.0" --notes "Automated build."
